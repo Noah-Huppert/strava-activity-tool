@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from typing import Optional, TypedDict
+import typing
 import sys
 import os
 import logging
@@ -13,6 +14,8 @@ from urllib.parse import urlparse, urljoin
 import time
 
 logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("stravalib").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.WARN)
 
 DEFAULT_AUTH_FILE = "auth.json"
 
@@ -62,7 +65,7 @@ class AuthFileService:
     def save(self, data: AuthFile):
         """Save contents of auth file."""
         with open(self._path, 'w') as f:
-            json.dump(data.dict(), f)
+            json.dump(data.model_dump(), f)
 
     def get(self) -> Optional[AuthFile]:
         """Read contents of auth file.
@@ -176,6 +179,11 @@ def auth_flask_redirect():
         url = strava.authorization_url(
             client_id=auth_flask.config['strava_client_id'],
             redirect_uri=auth_flask.config['strava_redirect_url'],
+            scope=[
+                'read',
+                'activity:read',
+                'activity:write',
+            ]
         )
 
         return flask.redirect(url)
@@ -214,13 +222,14 @@ def auth_flask_callback():
 
     return "Done! You may end this CLI command", 200
 
-class ArgTypeStravaActivityType:
-    """Custom "Strava Activity Type" argument type for argparse."""
+class ArgTypeStravaSportType:
+    """Custom "Strava Sport Type" argument type for argparse."""
 
     def __call__(self, value: str) -> str:
         """Validate argument value."""
-        if value not in stravalib.model.DetailedActivity.TYPES:
-            raise argparse.ArgumentTypeError(f"'{value}' is not a valid Strava Activity Type, must be one of: {stravalib.model.DetailedActivity.TYPES}")
+        possible_vals = stravalib.model.RelaxedSportType.__annotations__["root"]
+        if value not in possible_vals:
+            raise argparse.ArgumentTypeError(f"'{value}' is not a valid Strava Sport Type, must be one of: {possible_vals}")
         return value
 
 def main(log: logging.Logger) -> int:
@@ -262,18 +271,25 @@ def main(log: logging.Logger) -> int:
     auth_clearp = auth_subp.add_parser("logout")
 
     # convert-activities
-    conv_actp = subp.add_parser("convert-activities")
+    conv_actp = subp.add_parser("update-activities")
     conv_actp.add_argument(
-        "--from-activity",
-        help="Type of activity to convert from",
-        type=ArgTypeStravaActivityType(),
-        required=True,
+        "--write",
+        help="Disable dry run mode",
+        action='store_true',
     )
     conv_actp.add_argument(
-        "--to-activity",
-        help="Type of activity to convert in to",
-        type=ArgTypeStravaActivityType(),
-        required=True,
+        "--filter-sport-type",
+        help="Filter activites to update by their sport type",
+        type=ArgTypeStravaSportType(),
+    )
+    conv_actp.add_argument(
+        "--set-sport-type",
+        help="Set activity sport type value",
+        type=ArgTypeStravaSportType(),
+    )
+    conv_actp.add_argument(
+        "--set-name",
+        help="Set activity name value",
     )
 
     args = parser.parse_args()
@@ -329,11 +345,71 @@ def main(log: logging.Logger) -> int:
         elif args.subsubcmd == "logout":
             auth_file_svc.clear()
             log.info("All local authentication data deleted")
-    elif args.subcmd == "convert-activities":
+    elif args.subcmd == "update-activities":
         strava = auth_file_svc.strava_client()
 
+        # Validate there is at least one filter argument
+        filter_fields = list()
+        if args.filter_sport_type is not None:
+            filter_fields.append({
+                'key': 'sport_type',
+                'get_value': lambda a: a.sport_type.root,
+            })
+
+        if len(filter_fields) == 0:
+            log.error("Must provide at least one --filter-... argument")
+            return 1
+
+        # Validate at least one set argument
+        set_fields = set()
+        set_fields_dict = dict()
+        if args.set_sport_type is not None:
+            set_fields.add('sport_type')
+            set_fields_dict['sport_type'] = args.set_sport_type
+        if args.set_name is not None:
+            set_fields.add('name')
+            set_fields_dict['name'] = args.set_name
+
+        set_field_values_str = ", ".join(list(map(lambda entry: f"{entry[0]}='{entry[1]}", set_fields_dict.items())))
+
+        if len(set_fields) == 0:
+            log.error("Must provide at least one --set-... argument")
+            return 1
+
+        if args.write is False:
+            log.info("[DRY RUN] Running in dry run mode, no changes would be made")
+            log.info("[DRY RUN] To disable dry run mode and actually make changes add the --write argument")
+
+        total_matched = 0
         for activity in strava.get_activities():
-            print(activity.type)
+            # Check is "from" type
+            if args.filter_sport_type is not None and activity.sport_type.root != args.filter_sport_type:
+                continue
+
+            total_matched += 1
+
+            # Update activity
+            filter_field_values = []
+            for field in filter_fields:
+                key = field['key']
+                get_value = field['get_value']
+
+                filter_field_values.append(f"{key}='{get_value(activity)}'")
+            filter_field_values_str = ", ".join(filter_field_values)
+
+            if args.write is True:
+                log.info("Updating activity %s (id=%d, %s) setting %s", activity.name, activity.id, filter_field_values_str, set_field_values_str)
+
+                strava.update_activity(
+                    activity_id=activity.id,
+                    **set_fields_dict,
+                )
+            else:
+                log.info("[DRY RUN] Would update activity %s (id=%d, %s) setting %s", activity.name, activity.id, filter_field_values_str, set_field_values_str)
+
+        log.info("Found %d matching activity(ies)", total_matched)
+
+
 
     return 0
 
