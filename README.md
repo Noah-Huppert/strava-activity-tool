@@ -10,7 +10,7 @@ CLI tool to help automate common Strava tasks.
 # Overview
 This tool uses the Strava API to automate common tasks:
 
-- [Updating multiple activities at once](#command-update-activities)
+- [Updating multiple activities at once](#command---update-activities)
 
 See the [setup instructions](#setup) to get started.
 
